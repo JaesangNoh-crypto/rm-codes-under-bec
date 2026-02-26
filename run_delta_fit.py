@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Find delta such that P_fail <= 2^(-δ₂ * √n)
+Find delta such that P_fail <= 2^(-δ * n^0.99)
 for punctured self-dual Reed-Muller codes RM*(r, 2r+1) on BEC,
 bit 0 always erased.
 
@@ -18,6 +18,7 @@ import subprocess, sys, os, math, argparse, time
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 def binom(n, k):
@@ -37,19 +38,55 @@ def rm_dim(r, m):
     return sum(binom(m, i) for i in range(r + 1))
 
 
-def run_sim(r, m, eps, nframes, nthr):
-    """Run rm_bec_sim at a single epsilon. Returns P_amb or None."""
+def run_sim(r, m, eps, nframes, nthr, pbar=None):
+    """Run rm_bec_sim at a single epsilon. Returns P_amb or None.
+    If pbar (tqdm bar) is given, updates it with frame-level progress."""
     cmd = ["./rm_bec_sim",
            "-r", str(r), "-m", str(m), "-f", str(nframes),
            "-s", f"{eps:.6f}", "-e", f"{eps:.6f}", "-d", "0.01",
-           "-t", str(nthr)]
-    ret = subprocess.run(cmd, capture_output=True, text=True)
+           "-t", str(nthr), "-p"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
 
-    if ret.returncode != 0:
-        print(f"    SIM ERROR RM*({r},{m}): {ret.stderr[:200]}")
+    # Read stderr in a thread to capture progress without blocking stdout
+    import threading, io
+    stderr_lines = []
+    prev_done = 0
+
+    def read_stderr():
+        nonlocal prev_done
+        for line in proc.stderr:
+            line = line.strip()
+            stderr_lines.append(line)
+            if pbar and line.startswith("PROGRESS "):
+                parts = line.split()
+                if len(parts) == 3:
+                    try:
+                        done = int(parts[1])
+                        delta = done - prev_done
+                        if delta > 0:
+                            pbar.update(delta)
+                            prev_done = done
+                    except ValueError:
+                        pass
+
+    t = threading.Thread(target=read_stderr, daemon=True)
+    t.start()
+
+    stdout_data = proc.stdout.read()
+    proc.wait()
+    t.join(timeout=2)
+
+    # Ensure pbar reaches 100%
+    if pbar and prev_done < nframes:
+        pbar.update(nframes - prev_done)
+
+    if proc.returncode != 0:
+        err = "\n".join(stderr_lines[:5])
+        tqdm.write(f"    SIM ERROR RM*({r},{m}): {err[:200]}")
         return None
 
-    for line in ret.stdout.strip().split("\n"):
+    for line in stdout_data.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -66,15 +103,15 @@ def run_sim(r, m, eps, nframes, nthr):
             except ValueError:
                 continue
 
-    print(f"    PARSE FAIL RM*({r},{m}), stdout:")
-    for line in ret.stdout.strip().split("\n")[-5:]:
-        print(f"      [{line}]")
+    tqdm.write(f"    PARSE FAIL RM*({r},{m}), stdout:")
+    for line in stdout_data.strip().split("\n")[-5:]:
+        tqdm.write(f"      [{line}]")
     return None
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fit δ₂ for RM*(r, 2r+1): P_amb ≤ 2^(-δ₂·√n)")
+        description="Fit δ for RM*(r, 2r+1): P_amb ≤ 2^(-δ·n^0.99)")
     parser.add_argument("--rmin", type=int, default=2,
                         help="minimum r (default 2)")
     parser.add_argument("--rmax", type=int, default=7,
@@ -107,7 +144,7 @@ def main():
         k = rm_dim(r, m)
         codes.append((r, m, n, k))
 
-    print(f"Punctured self-dual RM*(r, 2r+1) δ₂ fit")
+    print(f"Punctured self-dual RM*(r, 2r+1) δ fit")
     print(f"{'='*60}")
     print(f"  r = {rs[0]}..{rs[-1]} ({len(rs)} codes), m = 2r+1, n = 2^m - 1")
     print(f"  ε = {eps}, frames = {args.frames}, threads = {nthr}")
@@ -128,19 +165,23 @@ def main():
 
     results = []  # (r, m, n, k, P_amb)
     stopped_early = False
-    for r, m, n, k in codes:
+    for idx, (r, m, n, k) in enumerate(codes):
+        label = f"[{idx+1}/{len(codes)}] RM*({r},{2*r+1}) n={n}"
         if stopped_early:
             results.append((r, m, n, k, 0.0))
-            print(f"  {r:>3}  {m:>3}  {n:>7}  {'0 (skipped)':>14}  {'--':>8}")
+            tqdm.write(f"  {r:>3}  {m:>3}  {n:>7}  {'0 (skipped)':>14}  {'--':>8}")
             continue
+        pbar = tqdm(total=args.frames, desc=label, unit="fr",
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
         t0 = time.time()
-        pamb = run_sim(r, m, eps, args.frames, nthr)
+        pamb = run_sim(r, m, eps, args.frames, nthr, pbar=pbar)
         dt = time.time() - t0
+        pbar.close()
         results.append((r, m, n, k, pamb))
         ps = f"{pamb:.6e}" if pamb is not None else "N/A"
-        print(f"  {r:>3}  {m:>3}  {n:>7}  {ps:>14}  {dt:>7.1f}s")
+        tqdm.write(f"  {r:>3}  {m:>3}  {n:>7}  {ps:>14}  {dt:>7.1f}s")
         if pamb is not None and pamb == 0.0:
-            print(f"  >>> P_amb = 0 at r={r} (n={n}), skipping larger r")
+            tqdm.write(f"  >>> P_amb = 0 at r={r} (n={n}), skipping larger r")
             stopped_early = True
 
     # Save raw CSV
@@ -152,104 +193,116 @@ def main():
     print(f"\nRaw data saved to delta_raw.csv\n")
 
     # Step 2: Fit delta
-    print("STEP 2: Fit δ₂  (model: P_amb ≤ 2^(-δ₂·√n))")
+    EXP = 0.99
+    print(f"STEP 2: Fit δ  (model: P_amb ≤ 2^(-δ·n^{EXP}))")
     print("-" * 60)
 
-    points = []  # (r, m, n, sqn, secbits, pamb)
+    points = []  # (r, m, n, secbits, pamb)
     for r, m, n, k, pamb in results:
         if pamb is not None and pamb > 0:
-            sqn = math.sqrt(n)
             secbits = -math.log2(2 * pamb)
-            points.append((r, m, n, sqn, secbits, pamb))
+            points.append((r, m, n, secbits, pamb))
 
     if len(points) == 0:
         print("  No data points with P_amb > 0.")
         print("  Try increasing --frames.")
         return 1
 
-    print(f"\n  {'r':>3}  {'m':>3}  {'n':>7}  {'√n':>8}  {'P_amb':>14}  {'sec bits':>12}  {'bits/√n':>12}")
-    print(f"  {'-'*3}  {'-'*3}  {'-'*7}  {'-'*8}  {'-'*14}  {'-'*12}  {'-'*12}")
-    for r, m, n, sqn, sb, pf in points:
-        print(f"  {r:>3}  {m:>3}  {n:>7}  {sqn:>8.3f}  {pf:>14.6e}  {sb:>12.4f}  {sb/sqn:>12.6f}")
+    print(f"\n  {'r':>3}  {'m':>3}  {'n':>7}  {'P_amb':>14}  {'sec bits':>12}  {'bits/n^'+str(EXP):>14}")
+    print(f"  {'-'*3}  {'-'*3}  {'-'*7}  {'-'*14}  {'-'*12}  {'-'*14}")
+    for r, m, n, sb, pf in points:
+        ne = n ** EXP
+        print(f"  {r:>3}  {m:>3}  {n:>7}  {pf:>14.6e}  {sb:>12.4f}  {sb/ne:>14.6f}")
 
     # Save fit results
     with open("delta_fit.csv", "w") as f:
-        f.write("r,m,n,sqrt_n,P_amb,sec_bits,sec_bits_over_sqrt_n\n")
-        for r, m, n, sqn, sb, pf in points:
-            f.write(f"{r},{m},{n},{sqn:.6f},{pf:.12e},{sb:.10f},{sb/sqn:.10f}\n")
+        f.write(f"r,m,n,P_amb,sec_bits,sec_bits_over_n^{EXP}\n")
+        for r, m, n, sb, pf in points:
+            ne = n ** EXP
+            f.write(f"{r},{m},{n},{pf:.12e},{sb:.10f},{sb/ne:.10f}\n")
     print(f"\n  Fit data saved to delta_fit.csv")
 
     if len(points) < 2:
         print(f"\n  Only {len(points)} data point(s) — skipping fit and plot.")
         return 0
 
-    # δ₂_min: guaranteed bound for all tested n (in bits)
-    delta2_min = min(sb / sqn for _, _, _, sqn, sb, _ in points)
-
-    # Linear regression: sec_bits = δ₂·√n + c
-    sx  = sum(sq for _, _, _, sq, _, _ in points)
-    sy  = sum(sb for _, _, _, _, sb, _ in points)
-    sxx = sum(sq * sq for _, _, _, sq, _, _ in points)
-    sxy = sum(sq * sb for _, _, _, sq, sb, _ in points)
+    # Linear regression: sec_bits = δ·n^EXP + c
+    sx  = sum(n ** EXP for _, _, n, _, _ in points)
+    sy  = sum(sb for _, _, _, sb, _ in points)
+    sxx = sum((n ** EXP) ** 2 for _, _, n, _, _ in points)
+    sxy = sum((n ** EXP) * sb for _, _, n, sb, _ in points)
     nn  = len(points)
 
     denom = nn * sxx - sx * sx
     if abs(denom) > 1e-15:
-        delta2_fit = (nn * sxy - sx * sy) / denom
-        intercept = (sy - delta2_fit * sx) / nn
+        delta_fit = (nn * sxy - sx * sy) / denom
+        intercept = (sy - delta_fit * sx) / nn
     else:
-        delta2_fit, intercept = sxy / sxx, 0
+        delta_fit, intercept = sxy / sxx, 0
 
     # R²
-    ss_res = sum((sb - delta2_fit * sq - intercept)**2 for _, _, _, sq, sb, _ in points)
-    ss_tot = sum((sb - sy / nn)**2 for _, _, _, _, sb, _ in points)
+    ss_res = sum((sb - delta_fit * (n ** EXP) - intercept)**2 for _, _, n, sb, _ in points)
+    ss_tot = sum((sb - sy / nn)**2 for _, _, _, sb, _ in points)
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+    # δ_min: if c >= 0, δ_fit·x is already below δ_fit·x+c, so δ_min = δ_fit
+    #        if c <  0, use min ratio across all points
+    if intercept >= 0:
+        delta_min = delta_fit
+    else:
+        delta_min = min(sb / (n ** EXP) for _, _, n, sb, _ in points)
 
     print(f"\n  Results ({len(points)} data points):")
     print(f"  ─────────────────────────────────────────")
-    print(f"  δ₂_min = {delta2_min:.6f}  (guaranteed: P ≤ 2^(-{delta2_min:.4f}·√n) ∀n)")
-    print(f"  δ₂_fit = {delta2_fit:.6f}  (c = {intercept:.4f}, R² = {r2:.6f})")
+    print(f"  δ_min = {delta_min:.8f}  ({'= δ_fit (c≥0)' if intercept >= 0 else 'min ratio (c<0)'})")
+    print(f"  δ_fit = {delta_fit:.8f}  (c = {intercept:.4f}, R² = {r2:.6f})")
     print()
 
     # Target security levels
-    print(f"  Target security (using δ₂_min = {delta2_min:.4f}):")
+    print(f"  Target security (using δ_min = {delta_min:.6f}):")
     for target in [40, 60, 80, 128]:
-        n_req = (target / delta2_min) ** 2
-        print(f"    {target:>3}-bit security:  n ≥ {n_req:.0f}  (√n ≥ {math.sqrt(n_req):.1f})")
+        n_req = (target / delta_min) ** (1.0 / EXP)
+        print(f"    {target:>3}-bit security:  n ≥ {n_req:.0f}")
     print()
 
     # ── Plot ──
     print(f"  Generating plot ...")
 
-    sqns = np.array([d[3] for d in points])
-    sbs  = np.array([d[4] for d in points])
+    ne_arr = np.array([d[2] ** EXP for d in points])
+    sbs    = np.array([d[3] for d in points])
 
-    sq_max = max(max(sqns) * 1.15, 62 / delta2_min * 1.05)
-    sq_range = np.linspace(0, sq_max, 200)
+    ymax = 40
+    n_max = max(d[2] for d in points)
+    ne_max = (n_max * 1.15) ** EXP          # 15% padding beyond largest n
+    ne_range = np.linspace(0, ne_max, 400)
 
     fig, ax = plt.subplots(figsize=(9, 6))
 
-    ax.scatter(sqns, sbs, s=60, c="#2563eb", zorder=5,
+    ax.scatter(ne_arr, sbs, s=60, c="#2563eb", zorder=5,
                label="Simulated", edgecolors="white", linewidth=0.5)
-    ax.plot(sq_range, delta2_min * sq_range,
+    # clip hypothesis lines to y <= ymax
+    y_min_line = delta_min * ne_range
+    y_fit_line = delta_fit * ne_range + intercept
+    ax.plot(ne_range[y_min_line <= ymax], y_min_line[y_min_line <= ymax],
             "--", color="#ef4444", linewidth=2,
-            label=f"δ₂_min = {delta2_min:.4f}")
-    ax.plot(sq_range, delta2_fit * sq_range + intercept,
+            label=f"δ_min·n^{EXP}  (δ_min = {delta_min:.6f})")
+    ax.plot(ne_range[y_fit_line <= ymax], y_fit_line[y_fit_line <= ymax],
             "-.", color="#f59e0b", linewidth=2,
-            label=f"δ₂_fit = {delta2_fit:.4f}, c={intercept:.2f} (R²={r2:.3f})")
-    for r, m, n, sq, sb, _ in points:
-        ax.annotate(f"r={r}", (sq, sb), fontsize=7,
+            label=f"δ_fit·n^{EXP} + c  (δ_fit = {delta_fit:.6f}, c={intercept:.2f}, R²={r2:.3f})")
+    for r, m, n, sb, _ in points:
+        ax.annotate(f"n={n}", (n ** EXP, sb), fontsize=7,
                     textcoords="offset points", xytext=(5, 5), color="#64748b")
-    for sec, col in [(20, "#cbd5e1"), (40, "#94a3b8"), (60, "#64748b")]:
+    for sec, col in [(20, "#cbd5e1"), (40, "#94a3b8")]:
         ax.axhline(sec, color=col, linewidth=0.8, linestyle=":", alpha=0.5)
-        ax.text(sq_max * 0.98, sec, f"{sec}-bit", fontsize=8, color=col, va="bottom", ha="right")
+        ax.text(ne_max * 0.98, sec, f"{sec}-bit", fontsize=8, color=col, va="bottom", ha="right")
 
-    ax.set_xlabel("√n", fontsize=12)
+    ax.set_xlabel(f"$n^{{{EXP}}}$", fontsize=12)
     ax.set_ylabel("Security bits  (−log₂ P_fail)", fontsize=12)
     ax.set_title(f"RM*(r, 2r+1) on BEC (ε = {eps})", fontsize=13, fontweight="bold")
     ax.legend(fontsize=9, loc="upper left")
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(left=0)
+    ax.set_xlim(left=0, right=ne_max)
+    ax.set_ylim(top=ymax)
 
     plt.tight_layout()
     plt.savefig("delta_fit.png", dpi=150, bbox_inches="tight")

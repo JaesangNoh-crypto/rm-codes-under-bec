@@ -324,8 +324,11 @@ static inline int ge_in_span(const GEWork *w, const uint64_t *v) {
 /* ================================================================
  *  Simulation
  * ================================================================ */
-static double simulate_eps(const HMat *H, double eps, int nframes, int nthr) {
+static double simulate_eps(const HMat *H, double eps, long long nframes, int nthr, int report_progress) {
     long long tot_amb = 0;
+    long long done_counter = 0;
+    long long report_interval = nframes / 100;
+    if (report_interval < 1) report_interval = 1;
     const double log1meps = (eps < 1.0 - 1e-15) ? log(1.0 - eps) : -40.0;
 
     #pragma omp parallel num_threads(nthr) reduction(+:tot_amb)
@@ -335,9 +338,10 @@ static double simulate_eps(const HMat *H, double eps, int nframes, int nthr) {
         rng_seed(&rng, 42ULL + (uint64_t)tid * 1000003ULL +
                  (uint64_t)(eps * 1e9));
         GEWork *ws = ge_alloc(H->nk, H->nw, H->nk);
+        long long local_done = 0;
 
-        #pragma omp for schedule(dynamic, 64)
-        for (int f = 0; f < nframes; f++) {
+        #pragma omp for schedule(dynamic, 4096)
+        for (long long f = 0; f < nframes; f++) {
             ge_reset(ws);
 
             if (eps < 1e-15) {
@@ -376,8 +380,26 @@ static double simulate_eps(const HMat *H, double eps, int nframes, int nthr) {
             const uint64_t *col0 = hmat_col(H, 0, ws->col_buf);
             if (ge_in_span(ws, col0))
                 tot_amb++;
+
+            if (report_progress && (++local_done & 1023) == 0) {
+                #pragma omp atomic
+                done_counter += 1024;
+                long long d = done_counter; /* racy read is fine for progress */
+                if (d / report_interval != (d - 1024) / report_interval) {
+                    fprintf(stderr, "PROGRESS %lld %lld\n", d, nframes);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (report_progress && (local_done & 1023)) {
+            #pragma omp atomic
+            done_counter += (local_done & 1023);
         }
         ge_free(ws);
+    }
+    if (report_progress) {
+        fprintf(stderr, "PROGRESS %lld %lld\n", nframes, nframes);
+        fflush(stderr);
     }
     return (double)tot_amb / nframes;
 }
@@ -388,7 +410,7 @@ static double simulate_eps(const HMat *H, double eps, int nframes, int nthr) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s -r <order> -m <param> -f <nframes> [-s start] [-e end] [-d step] [-t threads] [-o file.csv]\n"
+        "  %s -r <order> -m <param> -f <nframes> [-s start] [-e end] [-d step] [-t threads] [-o file.csv] [-p]\n"
         "\nOptions:\n"
         "  -r order     Reed-Muller order r (0 <= r < m)\n"
         "  -m param     Reed-Muller parameter m (code length = 2^m - 1)\n"
@@ -397,7 +419,8 @@ static void usage(const char *prog) {
         "  -e end       Epsilon range end   (default 0.5)\n"
         "  -d step      Epsilon step        (default 0.02)\n"
         "  -t threads   OpenMP threads (default: all)\n"
-        "  -o file.csv  Write CSV output\n",
+        "  -o file.csv  Write CSV output\n"
+        "  -p           Report frame progress to stderr\n",
         prog);
 }
 
@@ -405,25 +428,27 @@ int main(int argc, char **argv) {
     int    rm_r    = -1;
     int    rm_m    = -1;
     char  *csvfile = NULL;
-    int    nframes = 0;
+    long long nframes = 0;
     double eps_s = 0.4, eps_e = 0.5, eps_d = 0.02;
     int    nthr = omp_get_max_threads();
+    int    report_progress = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:m:f:s:e:d:t:o:h")) != -1) {
+    while ((opt = getopt(argc, argv, "r:m:f:s:e:d:t:o:ph")) != -1) {
         switch (opt) {
         case 'r': rm_r    = atoi(optarg);  break;
         case 'm': rm_m    = atoi(optarg);  break;
-        case 'f': nframes = atoi(optarg);  break;
+        case 'f': nframes = atoll(optarg);  break;
         case 's': eps_s   = atof(optarg);  break;
         case 'e': eps_e   = atof(optarg);  break;
         case 'd': eps_d   = atof(optarg);  break;
         case 't': nthr    = atoi(optarg);  break;
         case 'o': csvfile = optarg;        break;
+        case 'p': report_progress = 1;     break;
         default: usage(argv[0]); return 1;
         }
     }
-    if (rm_r < 0 || rm_m < 0 || !nframes) { usage(argv[0]); return 1; }
+    if (rm_r < 0 || rm_m < 0 || nframes <= 0) { usage(argv[0]); return 1; }
 
     /* Build H */
     printf("Building RM(%d,%d) code ...\n", rm_r, rm_m);
@@ -433,7 +458,7 @@ int main(int argc, char **argv) {
     int n = H->n, k = H->k;
     printf("Code: (%d, %d), R = %.4f, %d words/col, %d threads\n",
            n, k, (double)k/n, H->nw, nthr);
-    printf("Frames: %d, eps: [%.4f, %.4f] step %.4f\n", nframes, eps_s, eps_e, eps_d);
+    printf("Frames: %lld, eps: [%.4f, %.4f] step %.4f\n", nframes, eps_s, eps_e, eps_d);
 #ifdef __AVX2__
     printf("SIMD: AVX2 enabled (256-bit XOR)\n\n");
 #else
@@ -446,20 +471,20 @@ int main(int argc, char **argv) {
         if (csv) fprintf(csv, "epsilon,P_ambiguous,frames,time_sec\n");
     }
 
-    printf("%-12s %-18s %-10s %s\n", "epsilon", "P(ambiguous)", "frames", "time");
-    printf("%-12s %-18s %-10s %s\n", "--------", "----------", "------", "----");
+    printf("%-12s %-18s %-14s %s\n", "epsilon", "P(ambiguous)", "frames", "time");
+    printf("%-12s %-18s %-14s %s\n", "--------", "----------", "------", "----");
 
     for (double eps = eps_s; eps <= eps_e + eps_d * 0.01; eps += eps_d) {
         if (eps > 1.0) eps = 1.0;
         double t0 = omp_get_wtime();
-        double pamb = simulate_eps(H, eps, nframes, nthr);
+        double pamb = simulate_eps(H, eps, nframes, nthr, report_progress);
         double dt = omp_get_wtime() - t0;
 
-        printf("%-12.4f %-18.8f %-10d %.3fs\n", eps, pamb, nframes, dt);
+        printf("%-12.4f %-18.8f %-14lld %.3fs\n", eps, pamb, nframes, dt);
         fflush(stdout);
 
         if (csv) {
-            fprintf(csv, "%.6f,%.10f,%d,%.4f\n", eps, pamb, nframes, dt);
+            fprintf(csv, "%.6f,%.10f,%lld,%.4f\n", eps, pamb, nframes, dt);
             fflush(csv);
         }
         if (eps >= 1.0 - 1e-9) break;
